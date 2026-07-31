@@ -2,17 +2,17 @@
 
 Minimal Python agent using Microsoft Agent Framework, Agent 365 observability,
 and a Microsoft Foundry toolbox. The agent authenticates to the toolbox as its
-own Microsoft Entra Agent Identity through the Microsoft Entra ID Auth SDK
-sidecar.
+own Microsoft Entra Agent Identity by performing the Agent ID token exchange
+directly in the SaaS process.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-	 A[SaaS agent] -->|AgentIdentity=instance app ID| S[AgentID sidecar]
-	 S -->|blueprint workload credential + fmi_path| E[Microsoft Entra ID]
-	 E -->|agent token: aud https://ai.azure.com| S
-	 S -->|Bearer token| A
+	 A[SaaS agent] -->|blueprint workload credential + fmi_path| E[Microsoft Entra ID]
+	 E -->|parent exchange token| A
+	 A -->|parent token as child assertion| E
+	 E -->|agent token: aud https://ai.azure.com| A
 	 A -->|MCP over HTTPS| T[Foundry toolbox]
 ```
 
@@ -21,13 +21,62 @@ The `fmi_path` exchange selects one child Agent Identity, so the toolbox call is
 auditable as that agent instance. Do not give the Agent Identity a secret; Agent
 Identities cannot own credentials.
 
+## Provision the Entra identities
+
+For interactive administrator setup, install Microsoft Graph PowerShell once:
+
+```powershell
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+```
+
+Then run the provisioner. It opens an interactive sign-in and requests only the
+delegated scopes required by these three operations:
+
+```powershell
+.\provision_agent_identity.ps1 `
+	-TenantId '<tenant-id>' `
+	-BlueprintName 'External SaaS Agent Blueprint' `
+	-AgentName 'External SaaS Agent Instance' `
+	-SponsorUserId '<sponsor-user-object-id>' `
+	-UseDeviceCode
+```
+
+The signed-in user must hold a supported Agent ID role. An administrator might
+also need to consent to these delegated Microsoft Graph permissions:
+
+- `AgentIdentityBlueprint.Create`
+- `AgentIdentityBlueprintPrincipal.Create`
+- `AgentIdentity.Create.All`
+
+For unattended automation, the Python provisioner instead uses a dedicated app
+registration with the equivalent **application** permissions and tenant-wide
+admin consent. Configure its credential and the sponsor's user object ID:
+
+```powershell
+$env:ENTRA_TENANT_ID = '<tenant-id>'
+$env:AGENT_ID_SETUP_CLIENT_ID = '<setup-application-id>'
+$env:AGENT_ID_SETUP_CLIENT_SECRET = '<setup-application-secret>'
+$env:AGENT_ID_SETUP_SPONSOR_USER_ID = '<sponsor-user-object-id>'
+
+python .\provision_agent_identity.py `
+	--blueprint-name 'External SaaS Agent Blueprint' `
+	--agent-name 'External SaaS Agent Instance'
+```
+
+The command creates the blueprint, its mandatory BlueprintPrincipal, and one
+Agent Identity in that order through the typed Microsoft Graph endpoints. Its
+JSON output distinguishes application IDs from object IDs. Set
+`AGENT_IDENTITY_BLUEPRINT_CLIENT_ID` and `AGENT_IDENTITY_CLIENT_ID` from the two
+application ID values. Use `agent_identity_object_id` when assigning Azure RBAC
+to the Agent Identity. The setup secret is only for the provisioning app and
+must not be reused as the blueprint runtime credential.
+
 ## Responsibility split
 
 ### Customer tenant administrator
 
-1. Create an Agent Identity Blueprint, its BlueprintPrincipal, and one Agent
-	Identity for the SaaS agent instance. Use the typed Microsoft Graph endpoints
-	in the [Agent ID setup guide][agent-id-setup].
+1. Run the provisioning command above to create an Agent Identity Blueprint,
+	its BlueprintPrincipal, and one Agent Identity for the SaaS agent instance.
 2. Put the runtime credential on the blueprint. For production, add a federated
 	identity credential (FIC) whose issuer, subject, and audience exactly match the
 	workload assertion supplied by the SaaS provider.
@@ -42,9 +91,8 @@ Identities cannot own credentials.
 
 1. Supply a stable workload identity and document its OIDC issuer, subject, and
 	audience so the customer can create the FIC.
-2. Run the AgentID sidecar privately beside the agent, or implement the documented
-	two-step `fmi_path` exchange directly. Never expose the sidecar through an
-	ingress or public load balancer.
+2. Perform the documented two-step `fmi_path` exchange directly in the SaaS
+	process. The implementation is isolated in `agent_identity.py`.
 3. Ask for `https://ai.azure.com/.default` when calling the toolbox and pass the
 	resulting `Bearer` value on every MCP request.
 4. Set `AGENT_IDENTITY_CLIENT_ID` to the child Agent Identity application ID.
@@ -52,19 +100,17 @@ Identities cannot own credentials.
 5. Cache tokens only until expiry, protect workload assertions, and log the Agent
 	Identity object/application IDs with each invocation for audit correlation.
 
-If the SaaS cannot host a companion container, it must support external OIDC
-workload federation and the two-step Agent ID exchange itself. In that model the
-provider exchanges its workload assertion for the parent token, then exchanges
-that token as the selected Agent Identity for `https://ai.azure.com/.default`.
-Sharing a blueprint client secret is suitable only for a short-lived development
-test, not the production handoff.
+The provider exchanges its workload assertion for the parent token, then
+exchanges that token as the selected Agent Identity for
+`https://ai.azure.com/.default`. Sharing a blueprint client secret is suitable
+only for a short-lived development test, not the production handoff.
 
 ## Run locally
 
-Local Docker Compose uses a blueprint secret only to make initial testing easy.
+Local development uses a blueprint secret only to make initial testing easy.
 
 ```powershell
-python -m venv .venv
+# python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
@@ -72,7 +118,6 @@ Copy-Item .env.example .env
 $env:ENTRA_TENANT_ID = '<tenant-id>'
 $env:AGENT_IDENTITY_BLUEPRINT_CLIENT_ID = '<blueprint-app-id>'
 $env:AGENT_IDENTITY_BLUEPRINT_CLIENT_SECRET = '<development-only-secret>'
-docker compose up -d
 python app.py
 ```
 
@@ -81,25 +126,23 @@ by `azd ai toolbox show <toolbox-name> --output json`.
 
 The model connection uses `DefaultAzureCredential`; sign in with `az login` for
 local development. Toolbox authentication does not use that credential: it uses
-the per-instance Agent Identity token returned by the sidecar.
+the per-instance Agent Identity token acquired by the direct exchange.
 
-## Production sidecar
+## Production federation
 
-Use a federated credential instead of `ClientSecret`. For AKS, label the pod for
-Azure Workload Identity and configure:
+Configure a federated identity credential on the blueprint whose issuer, subject,
+and audience match the SaaS workload identity. Project the resulting OIDC token
+into the application and configure:
 
-```yaml
-AzureAd__TenantId: <agent-identity-home-tenant>
-AzureAd__ClientId: <blueprint-application-id>
-AzureAd__ClientCredentials__0__SourceType: SignedAssertionFilePath
-DownstreamApis__Toolbox__BaseUrl: https://ai.azure.com
-DownstreamApis__Toolbox__Scopes: https://ai.azure.com/.default
-DownstreamApis__Toolbox__RequestAppToken: "true"
+```text
+ENTRA_TENANT_ID=<agent-identity-home-tenant>
+AGENT_IDENTITY_BLUEPRINT_CLIENT_ID=<blueprint-application-id>
+AGENT_IDENTITY_CLIENT_ID=<agent-identity-application-id>
+AGENT_IDENTITY_BLUEPRINT_ASSERTION_FILE=<path-to-projected-oidc-token>
 ```
 
-For another SaaS hosting platform, use its external OIDC assertion and configure
-the blueprint FIC to match it. Confirm the sidecar/runtime supports that
-platform's projected assertion path; otherwise use direct federation.
+Do not also set `AGENT_IDENTITY_BLUEPRINT_CLIENT_SECRET`. The assertion is read
+for every token refresh so a hosting platform can rotate the projected token.
 
 ## Important toolbox behavior
 
@@ -117,11 +160,11 @@ prompt is a guardrail, not a complete approval UI.
 
 - [Create, test, and deploy a toolbox in Foundry][toolbox]
 - [Integrate third-party agents with Entra Agent ID][third-party]
-- [Microsoft Entra ID Auth SDK sidecar configuration][sidecar]
+- [Authenticate autonomous agents with Entra Agent ID][agent-auth]
 - [Agent 365 SDK overview][agent-365]
 
 [toolbox]: https://learn.microsoft.com/azure/foundry/agents/how-to/tools/toolbox?pivots=python
 [third-party]: https://learn.microsoft.com/entra/agent-id/configure-third-party-agents
-[sidecar]: https://learn.microsoft.com/entra/msidweb/agent-id-sdk/configuration
+[agent-auth]: https://learn.microsoft.com/entra/agent-id/autonomous-agent-authentication-authorization-flow
 [agent-id-setup]: https://learn.microsoft.com/entra/agent-id/identity-platform/agent-id-setup-instructions
 [agent-365]: https://learn.microsoft.com/microsoft-agent-365/developer/agent-365-sdk

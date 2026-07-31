@@ -30,11 +30,16 @@ async def main() -> None:
         service_name="external-saas-agent",
         service_namespace="agent365.samples",
     )
-    AgentFrameworkInstrumentor().instrument()
+    AgentFrameworkInstrumentor().instrument(skip_dep_check=True)
 
     token_provider = AgentIdentityTokenProvider(
-        sidecar_url=os.getenv("AGENTID_SIDECAR_URL", "http://localhost:5000"),
+        tenant_id=required_setting("ENTRA_TENANT_ID"),
+        blueprint_client_id=required_setting("AGENT_IDENTITY_BLUEPRINT_CLIENT_ID"),
         agent_identity_client_id=required_setting("AGENT_IDENTITY_CLIENT_ID"),
+        blueprint_client_secret=os.getenv("AGENT_IDENTITY_BLUEPRINT_CLIENT_SECRET"),
+        blueprint_assertion_file=os.getenv(
+            "AGENT_IDENTITY_BLUEPRINT_ASSERTION_FILE"
+        ),
     )
 
     credential = DefaultAzureCredential()
